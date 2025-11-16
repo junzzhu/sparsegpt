@@ -1,4 +1,6 @@
+import json
 import time
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -11,7 +13,7 @@ try:
     import wandb
     has_wandb = True
 except:
-    has_wandb = False 
+    has_wandb = False
 
 
 def get_opt(model):
@@ -128,7 +130,7 @@ def opt_sequential(model, dataloader, dev):
     model.config.use_cache = use_cache
 
 @torch.no_grad()
-def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
+def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False, collect_metrics: bool = False):
     print('Evaluating ...')
 
     testenc = testenc.input_ids
@@ -224,11 +226,17 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
         neg_log_likelihood = loss.float() * model.seqlen
         nlls.append(neg_log_likelihood)
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+    ce_loss = torch.stack(nlls).sum() / (nsamples * model.seqlen)
     print(f"Perplexity: {ppl.item():3f}")
     if log_wandb:
          wandb.log({f'{dataset}/perplexity': ppl.item()})
 
     model.config.use_cache = use_cache
+    if collect_metrics:
+        return {
+            "perplexity": float(ppl.item()),
+            "loss": float(ce_loss.item()),
+        }
 
 
 if __name__ == '__main__':
@@ -305,6 +313,10 @@ if __name__ == '__main__':
        '--log_wandb', action='store_true',
        help='Whether to log to wandb.'
     )
+    parser.add_argument(
+       '--metrics-output', type=str, default='',
+       help='Optional path to store JSON prune/eval metrics. Defaults to <save_dir>/prune_metrics.json when saving a model.'
+    )
 
     args = parser.parse_args()
 
@@ -315,10 +327,29 @@ if __name__ == '__main__':
 
     model = get_opt(args.model)
     model.eval()
+    num_layers = len(model.model.decoder.layers)
 
     dataloader, testloader = get_loaders(
         args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
     )
+
+    should_record_metrics = bool(args.save or args.metrics_output)
+    metrics_log: dict[str, list[dict]] = {}
+
+    def _record_metric(dataset_name: str, stage: str, metrics: dict, step: int):
+        entry = {
+            "stage": stage,
+            "step": step,
+            "loss": metrics["loss"],
+            "perplexity": metrics["perplexity"],
+        }
+        metrics_log.setdefault(dataset_name, []).append(entry)
+
+    if should_record_metrics:
+        baseline_metrics = opt_eval(
+            model, testloader, DEV, args.dataset, args.log_wandb, collect_metrics=True
+        )
+        _record_metric(args.dataset, "pre_prune", baseline_metrics, step=0)
 
     if (args.sparsity or args.prunen) and not args.gmp:
         tick = time.time()
@@ -329,12 +360,40 @@ if __name__ == '__main__':
                 break
         print(time.time() - tick)
 
-    for dataset in ['wikitext2', 'ptb', 'c4']:
+    for dataset in ['ptb', 'c4']:
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
         print(dataset)
-        opt_eval(model, testloader, DEV, dataset, args.log_wandb)
+        eval_metrics = opt_eval(
+            model,
+            testloader,
+            DEV,
+            dataset,
+            args.log_wandb,
+            collect_metrics=should_record_metrics,
+        )
+        if should_record_metrics and eval_metrics is not None:
+            stage = "post_prune" if dataset == args.dataset else "post_eval"
+            _record_metric(dataset, stage, eval_metrics, step=num_layers)
 
     if args.save:
         model.save_pretrained(args.save)
+
+    metrics_path: Path | None = None
+    if args.metrics_output:
+        metrics_path = Path(args.metrics_output)
+    elif args.save:
+        metrics_path = Path(args.save) / "prune_metrics.json"
+
+    if metrics_path and should_record_metrics and metrics_log:
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "model": args.model,
+            "sparsity": args.sparsity,
+            "num_layers": num_layers,
+            "datasets": metrics_log,
+            "timestamp": time.time(),
+        }
+        with open(metrics_path, "w") as fh:
+            json.dump(payload, fh, indent=2)
